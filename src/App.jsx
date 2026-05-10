@@ -41,6 +41,7 @@ const FILL_COLORS = ["#AFA9EC", "#5DCAA5", "#F0997B", "#85B7EB", "#B4B2A9", "#FA
 
 const STENCIL_LIBRARY = [];
 const RESIZE_HANDLES = ["nw", "ne", "sw", "se"];
+const CONNECTOR_HANDLES = ["n", "e", "s", "w"];
 
 const INITIAL_ELEMENTS = [];
 const LEGACY_DEMO_TEXTS = new Set([
@@ -152,14 +153,98 @@ function buildElementFromTool(toolId, point) {
   return null;
 }
 
+function getConnectorDirection(handle) {
+  if (handle === "n") {
+    return { x: 0, y: -1 };
+  }
+  if (handle === "e") {
+    return { x: 1, y: 0 };
+  }
+  if (handle === "s") {
+    return { x: 0, y: 1 };
+  }
+  if (handle === "w") {
+    return { x: -1, y: 0 };
+  }
+
+  return null;
+}
+
+function getFallbackArrowDirection(start, end) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return { x: dx === 0 ? 1 : Math.sign(dx), y: 0 };
+  }
+
+  return { x: 0, y: dy === 0 ? 1 : Math.sign(dy) };
+}
+
+function getArrowCurveControls(start, end, sourceHandle, targetHandle) {
+  const distance = Math.hypot(end.x - start.x, end.y - start.y);
+  const sourceDirection = getConnectorDirection(sourceHandle) || getFallbackArrowDirection(start, end);
+  const targetHandleDirection = getConnectorDirection(targetHandle);
+  const targetDirection = targetHandleDirection
+    ? { x: -targetHandleDirection.x, y: -targetHandleDirection.y }
+    : getFallbackArrowDirection(start, end);
+
+  const offset = clamp(distance * 0.42, 20, 170);
+  const cappedOffset = Math.max(12, Math.min(offset, distance * 0.75 || 12));
+
+  return {
+    startControl: {
+      x: start.x + sourceDirection.x * cappedOffset,
+      y: start.y + sourceDirection.y * cappedOffset
+    },
+    endControl: {
+      x: end.x - targetDirection.x * cappedOffset,
+      y: end.y - targetDirection.y * cappedOffset
+    }
+  };
+}
+
+function getArrowPathData(start, end, sourceHandle, targetHandle) {
+  const { startControl, endControl } = getArrowCurveControls(start, end, sourceHandle, targetHandle);
+  return [
+    "M",
+    start.x,
+    start.y,
+    "C",
+    startControl.x,
+    startControl.y,
+    endControl.x,
+    endControl.y,
+    end.x,
+    end.y
+  ].join(" ");
+}
+
+function getArrowBounds(start, end, sourceHandle, targetHandle) {
+  const { startControl, endControl } = getArrowCurveControls(start, end, sourceHandle, targetHandle);
+  const xs = [start.x, end.x, startControl.x, endControl.x];
+  const ys = [start.y, end.y, startControl.y, endControl.y];
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(24, maxX - minX),
+    height: Math.max(24, maxY - minY)
+  };
+}
+
 function getElementBounds(element) {
   if (element.type === "arrow") {
-    return {
-      x: Math.min(element.x1, element.x2),
-      y: Math.min(element.y1, element.y2),
-      width: Math.max(24, Math.abs(element.x2 - element.x1)),
-      height: Math.max(24, Math.abs(element.y2 - element.y1))
-    };
+    return getArrowBounds(
+      { x: element.x1, y: element.y1 },
+      { x: element.x2, y: element.y2 },
+      element.sourceHandle,
+      element.targetHandle
+    );
   }
 
   if (element.type === "pen") {
@@ -315,8 +400,96 @@ function resizeElementFromHandle(element, handle, dx, dy) {
   };
 }
 
+function isArrowConnectableElement(element) {
+  return element.type === "rect" || element.type === "ellipse" || element.type === "sticky";
+}
+
+function getConnectorPoint(element, handle) {
+  const centerX = element.x + element.width / 2;
+  const centerY = element.y + element.height / 2;
+
+  if (handle === "n") {
+    return { x: centerX, y: element.y };
+  }
+  if (handle === "e") {
+    return { x: element.x + element.width, y: centerY };
+  }
+  if (handle === "s") {
+    return { x: centerX, y: element.y + element.height };
+  }
+
+  return { x: element.x, y: centerY };
+}
+
+function findNearestConnector(point, elements, maxDistance, ignoredConnector) {
+  let nearest = null;
+  let nearestDistance = maxDistance;
+
+  for (const element of elements) {
+    if (!isArrowConnectableElement(element)) {
+      continue;
+    }
+
+    for (const handle of CONNECTOR_HANDLES) {
+      if (
+        ignoredConnector &&
+        ignoredConnector.elementId === element.id &&
+        ignoredConnector.handle === handle
+      ) {
+        continue;
+      }
+
+      const connectorPoint = getConnectorPoint(element, handle);
+      const distance = Math.hypot(point.x - connectorPoint.x, point.y - connectorPoint.y);
+
+      if (distance <= nearestDistance) {
+        nearest = {
+          elementId: element.id,
+          handle,
+          point: connectorPoint
+        };
+        nearestDistance = distance;
+      }
+    }
+  }
+
+  return nearest;
+}
+
+function getSelectionBox(start, end) {
+  return {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x),
+    height: Math.abs(end.y - start.y)
+  };
+}
+
+function doBoundsIntersect(bounds, box) {
+  return (
+    bounds.x < box.x + box.width &&
+    bounds.x + bounds.width > box.x &&
+    bounds.y < box.y + box.height &&
+    bounds.y + bounds.height > box.y
+  );
+}
+
 function splitText(text) {
   return (text || "").split("\n");
+}
+
+function isEditableTarget(target) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  const tag = target.tagName;
+  return (
+    target.isContentEditable ||
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT"
+  );
 }
 
 function filenameFromDocument(name) {
@@ -345,7 +518,7 @@ export default function App() {
   const [activeTool, setActiveTool] = useState("select");
   const [documentName, setDocumentName] = useState(DEFAULT_DOCUMENT_NAME);
   const [elements, setElements] = useState(INITIAL_ELEMENTS);
-  const [selectedId, setSelectedId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
   const [zoom, setZoom] = useState(1);
   const [status, setStatus] = useState("Loading from IndexedDB...");
   const [hydrated, setHydrated] = useState(false);
@@ -354,14 +527,29 @@ export default function App() {
   const [showVersions, setShowVersions] = useState(false);
   const [exportFormat, setExportFormat] = useState("png");
 
-  const [arrowStart, setArrowStart] = useState(null);
+  const [arrowDraft, setArrowDraft] = useState(null);
   const [penDraft, setPenDraft] = useState(null);
   const [dragState, setDragState] = useState(null);
   const [resizeState, setResizeState] = useState(null);
+  const [selectionBox, setSelectionBox] = useState(null);
+
+  const selectedId = selectedIds[selectedIds.length - 1] ?? null;
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const hasMultiSelection = selectedIds.length > 1;
+
+  function setSelectedId(nextId) {
+    setSelectedIds(nextId ? [nextId] : []);
+  }
 
   const selectedElement = useMemo(
-    () => elements.find((element) => element.id === selectedId) ?? null,
-    [elements, selectedId]
+    () => {
+      if (selectedIds.length !== 1) {
+        return null;
+      }
+
+      return elements.find((element) => element.id === selectedIds[0]) ?? null;
+    },
+    [elements, selectedIds]
   );
 
   useEffect(() => {
@@ -437,7 +625,7 @@ export default function App() {
   }, [hydrated, documentName, elements, zoom]);
 
   useEffect(() => {
-    if (!dragState && !resizeState && !penDraft) {
+    if (!dragState && !resizeState && !penDraft && !arrowDraft && !selectionBox) {
       return undefined;
     }
 
@@ -469,6 +657,31 @@ export default function App() {
         return;
       }
 
+      if (selectionBox) {
+        setSelectionBox((previous) => (previous ? { ...previous, end: point } : previous));
+        return;
+      }
+
+      if (arrowDraft) {
+        const snapTarget = findNearestConnector(point, elements, 18 / zoom, arrowDraft.source);
+        const nextEnd = snapTarget ? snapTarget.point : point;
+        setArrowDraft((previous) =>
+          previous
+            ? {
+                ...previous,
+                end: nextEnd,
+                target: snapTarget
+                  ? {
+                      elementId: snapTarget.elementId,
+                      handle: snapTarget.handle
+                    }
+                  : null
+              }
+            : previous
+        );
+        return;
+      }
+
       if (resizeState) {
         const dx = point.x - resizeState.start.x;
         const dy = point.y - resizeState.start.y;
@@ -491,11 +704,12 @@ export default function App() {
 
         setElements((previous) =>
           previous.map((element) => {
-            if (element.id !== dragState.id) {
+            const origin = dragState.origins[element.id];
+            if (!origin) {
               return element;
             }
 
-            return shiftElement(dragState.origin, dx, dy);
+            return shiftElement(origin, dx, dy);
           })
         );
       }
@@ -521,9 +735,65 @@ export default function App() {
       }
     }
 
-    function onPointerUp() {
+    function onPointerUp(event) {
       setDragState(null);
       setResizeState(null);
+
+      if (selectionBox) {
+        const box = getSelectionBox(selectionBox.start, selectionBox.end);
+        const isClickOnly = box.width < 3 && box.height < 3;
+
+        if (isClickOnly) {
+          setSelectedIds([]);
+          setStatus("Selection cleared.");
+        } else {
+          const nextSelectedIds = elements
+            .filter((element) => doBoundsIntersect(getElementBounds(element), box))
+            .map((element) => element.id);
+
+          setSelectedIds(nextSelectedIds);
+          if (nextSelectedIds.length === 0) {
+            setStatus("No elements inside selection.");
+          } else if (nextSelectedIds.length === 1) {
+            setStatus("1 element selected.");
+          } else {
+            setStatus(`${nextSelectedIds.length} elements selected.`);
+          }
+        }
+
+        setSelectionBox(null);
+        return;
+      }
+
+      if (arrowDraft) {
+        const releasedPoint = getCanvasPoint(event.clientX, event.clientY) ?? arrowDraft.end;
+        const snapTarget = findNearestConnector(releasedPoint, elements, 18 / zoom, arrowDraft.source);
+        const endPoint = snapTarget ? snapTarget.point : releasedPoint;
+        const distance = Math.hypot(endPoint.x - arrowDraft.start.x, endPoint.y - arrowDraft.start.y);
+
+        if (distance >= 12) {
+          const arrow = {
+            id: makeId(),
+            type: "arrow",
+            x1: arrowDraft.start.x,
+            y1: arrowDraft.start.y,
+            x2: endPoint.x,
+            y2: endPoint.y,
+            sourceHandle: arrowDraft.source.handle,
+            targetHandle: snapTarget ? snapTarget.handle : null,
+            stroke: "#5F5E5A",
+            strokeWidth: 2
+          };
+          setElements((previous) => [...previous, arrow]);
+          setSelectedId(arrow.id);
+          setStatus("Arrow connected.");
+        } else {
+          setStatus("Arrow cancelled. Drag farther to create a connector.");
+        }
+
+        setArrowDraft(null);
+        return;
+      }
 
       if (penDraft?.points?.length >= 4) {
         const newPenElement = {
@@ -549,7 +819,41 @@ export default function App() {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [dragState, resizeState, penDraft, zoom]);
+  }, [dragState, resizeState, penDraft, arrowDraft, selectionBox, zoom]);
+
+  useEffect(() => {
+    function onKeyDown(event) {
+      if (event.defaultPrevented || isEditableTarget(event.target)) {
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        const allIds = elements.map((element) => element.id);
+        setSelectedIds(allIds);
+        setStatus(allIds.length === 0 ? "No elements to select." : `${allIds.length} elements selected.`);
+        return;
+      }
+
+      if ((event.key !== "Delete" && event.key !== "Backspace") || selectedIds.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      const idsToDelete = new Set(selectedIds);
+      setElements((previous) => previous.filter((element) => !idsToDelete.has(element.id)));
+      setSelectedIds([]);
+      setArrowDraft(null);
+      setPenDraft(null);
+      setDragState(null);
+      setResizeState(null);
+      setSelectionBox(null);
+      setStatus(idsToDelete.size === 1 ? "Selected element deleted." : `${idsToDelete.size} elements deleted.`);
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [elements, selectedIds]);
 
   function getCanvasPointFromEvent(event) {
     const svg = svgRef.current;
@@ -574,7 +878,7 @@ export default function App() {
   }
 
   function updateSelected(updater) {
-    if (!selectedId) {
+    if (!selectedId || selectedIds.length !== 1) {
       return;
     }
 
@@ -600,38 +904,25 @@ export default function App() {
     }
 
     if (activeTool === "select") {
-      setSelectedId(null);
+      setSelectionBox({
+        start: point,
+        end: point
+      });
       return;
     }
 
     if (activeTool === "pen") {
       setSelectedId(null);
+      setSelectionBox(null);
       setPenDraft({ id: makeId(), points: [point.x, point.y] });
       return;
     }
 
     if (activeTool === "arrow") {
-      if (!arrowStart) {
-        setArrowStart(point);
-        setStatus("Arrow start set. Click again to place the end point.");
-      } else {
-        const arrow = {
-          id: makeId(),
-          type: "arrow",
-          x1: arrowStart.x,
-          y1: arrowStart.y,
-          x2: point.x,
-          y2: point.y,
-          stroke: "#5F5E5A",
-          strokeWidth: 2
-        };
-
-        setElements((previous) => [...previous, arrow]);
-        setSelectedId(arrow.id);
-        setArrowStart(null);
-        setStatus("Arrow added.");
-      }
-
+      setSelectedId(null);
+      setSelectionBox(null);
+      setArrowDraft(null);
+      setStatus("Arrow mode: drag from one connector dot to another.");
       return;
     }
 
@@ -642,14 +933,16 @@ export default function App() {
 
     setElements((previous) => [...previous, newElement]);
     setSelectedId(newElement.id);
+    setSelectionBox(null);
     setStatus(`${newElement.type} added.`);
   }
 
   function handleElementPointerDown(event, element) {
     event.stopPropagation();
-    setSelectedId(element.id);
 
     if (activeTool !== "select") {
+      setSelectedId(element.id);
+      setSelectionBox(null);
       return;
     }
 
@@ -658,9 +951,24 @@ export default function App() {
       return;
     }
 
+    const nextSelectedIds = selectedIdSet.has(element.id) ? selectedIds : [element.id];
+    if (!selectedIdSet.has(element.id)) {
+      setSelectedIds([element.id]);
+    }
+
+    const selectedLookup = new Set(nextSelectedIds);
+    const origins = {};
+    for (const item of elements) {
+      if (selectedLookup.has(item.id)) {
+        origins[item.id] = item;
+      }
+    }
+
+    setSelectionBox(null);
+    setResizeState(null);
     setDragState({
-      id: element.id,
-      origin: element,
+      ids: nextSelectedIds,
+      origins,
       start: point
     });
   }
@@ -677,6 +985,7 @@ export default function App() {
     }
 
     setSelectedId(element.id);
+    setSelectionBox(null);
     setDragState(null);
     setResizeState({
       id: element.id,
@@ -684,6 +993,27 @@ export default function App() {
       handle,
       start: point
     });
+  }
+
+  function handleConnectorPointerDown(event, element, handle) {
+    event.stopPropagation();
+    if (event.button !== 0 || activeTool !== "arrow" || !isArrowConnectableElement(element)) {
+      return;
+    }
+
+    const startPoint = getConnectorPoint(element, handle);
+    setSelectedId(element.id);
+    setSelectionBox(null);
+    setArrowDraft({
+      source: {
+        elementId: element.id,
+        handle
+      },
+      target: null,
+      start: startPoint,
+      end: startPoint
+    });
+    setStatus("Drag to another connector and release.");
   }
 
   function getResizeHandlePosition(element, handle) {
@@ -736,6 +1066,8 @@ export default function App() {
 
       setElements(version.elements || []);
       setZoom(version.zoom || 1);
+      setSelectedId(null);
+      setSelectionBox(null);
       setShowVersions(false);
       setStatus(`Version restored from ${formatTimestamp(version.updatedAt)}.`);
     } catch (error) {
@@ -754,8 +1086,11 @@ export default function App() {
       setDocumentName(DEFAULT_DOCUMENT_NAME);
       setElements(INITIAL_ELEMENTS);
       setSelectedId(null);
-      setArrowStart(null);
+      setSelectionBox(null);
+      setArrowDraft(null);
       setPenDraft(null);
+      setDragState(null);
+      setResizeState(null);
       setZoom(1);
       setStatus("Workspace reset. IndexedDB cleared.");
       setLastSavedAt(null);
@@ -864,12 +1199,15 @@ export default function App() {
     setElements((previous) => [...previous, newElement]);
     setActiveTab("app");
     setSelectedId(newElement.id);
+    setSelectionBox(null);
     setStatus(`${stencil.title} added from stencil library.`);
   }
 
   const selectedAnchor = selectedElement ? getElementAnchor(selectedElement) : null;
   const resizeHandleRadius = 6 / zoom;
   const resizeHandleStrokeWidth = 1.4 / zoom;
+  const connectorHandleRadius = 5 / zoom;
+  const connectorHandleStrokeWidth = 1.2 / zoom;
 
   return (
     <div className="app-shell">
@@ -957,7 +1295,11 @@ export default function App() {
                     title={tool.label}
                     onClick={() => {
                       setActiveTool(tool.id);
-                      setArrowStart(null);
+                      setArrowDraft(null);
+                      setSelectionBox(null);
+                      if (tool.id === "arrow") {
+                        setStatus("Arrow mode: drag from one connector dot to another.");
+                      }
                     }}
                   >
                     <Icon size={18} />
@@ -996,7 +1338,7 @@ export default function App() {
 
                 <g transform={`scale(${zoom})`}>
                   {elements.map((element) => {
-                    const isSelected = selectedId === element.id;
+                    const isSelected = selectedIdSet.has(element.id);
                     const bounds = isSelected ? getElementBounds(element) : null;
 
                     if (element.type === "rect" || element.type === "sticky") {
@@ -1040,6 +1382,7 @@ export default function App() {
                                 rx={10}
                               />
                               {activeTool === "select" &&
+                                !hasMultiSelection &&
                                 element.type === "rect" &&
                                 RESIZE_HANDLES.map((handle) => {
                                   const position = getResizeHandlePosition(element, handle);
@@ -1057,6 +1400,22 @@ export default function App() {
                                 })}
                             </>
                           )}
+
+                          {activeTool === "arrow" &&
+                            CONNECTOR_HANDLES.map((handle) => {
+                              const position = getConnectorPoint(element, handle);
+                              return (
+                                <circle
+                                  key={`connector-${element.id}-${handle}`}
+                                  className="connector-handle"
+                                  cx={position.x}
+                                  cy={position.y}
+                                  r={connectorHandleRadius}
+                                  strokeWidth={connectorHandleStrokeWidth}
+                                  onPointerDown={(event) => handleConnectorPointerDown(event, element, handle)}
+                                />
+                              );
+                            })}
                         </g>
                       );
                     }
@@ -1097,6 +1456,7 @@ export default function App() {
                                 rx={Math.floor((element.width + element.height) / 12)}
                               />
                               {activeTool === "select" &&
+                                !hasMultiSelection &&
                                 RESIZE_HANDLES.map((handle) => {
                                   const position = getResizeHandlePosition(element, handle);
                                   return (
@@ -1113,6 +1473,22 @@ export default function App() {
                                 })}
                             </>
                           )}
+
+                          {activeTool === "arrow" &&
+                            CONNECTOR_HANDLES.map((handle) => {
+                              const position = getConnectorPoint(element, handle);
+                              return (
+                                <circle
+                                  key={`connector-${element.id}-${handle}`}
+                                  className="connector-handle"
+                                  cx={position.x}
+                                  cy={position.y}
+                                  r={connectorHandleRadius}
+                                  strokeWidth={connectorHandleStrokeWidth}
+                                  onPointerDown={(event) => handleConnectorPointerDown(event, element, handle)}
+                                />
+                              );
+                            })}
                         </g>
                       );
                     }
@@ -1143,19 +1519,25 @@ export default function App() {
                     }
 
                     if (element.type === "arrow") {
+                      const arrowPathData = getArrowPathData(
+                        { x: element.x1, y: element.y1 },
+                        { x: element.x2, y: element.y2 },
+                        element.sourceHandle,
+                        element.targetHandle
+                      );
+
                       return (
                         <g
                           key={element.id}
                           className="canvas-element"
                           onPointerDown={(event) => handleElementPointerDown(event, element)}
                         >
-                          <line
-                            x1={element.x1}
-                            y1={element.y1}
-                            x2={element.x2}
-                            y2={element.y2}
+                          <path
+                            d={arrowPathData}
                             stroke={element.stroke}
                             strokeWidth={element.strokeWidth || 2}
+                            fill="none"
+                            strokeLinecap="round"
                             markerEnd="url(#arrowHead)"
                           />
 
@@ -1217,7 +1599,30 @@ export default function App() {
                     />
                   )}
 
-                  {arrowStart && <circle cx={arrowStart.x} cy={arrowStart.y} r="6" fill="#0C447C" opacity="0.55" />}
+                  {selectionBox && (
+                    <rect
+                      className="selection-marquee"
+                      {...getSelectionBox(selectionBox.start, selectionBox.end)}
+                    />
+                  )}
+
+                  {arrowDraft && (
+                    <path
+                      d={getArrowPathData(
+                        arrowDraft.start,
+                        arrowDraft.end,
+                        arrowDraft.source.handle,
+                        arrowDraft.target?.handle
+                      )}
+                      stroke="#5F5E5A"
+                      strokeWidth="2"
+                      fill="none"
+                      strokeLinecap="round"
+                      strokeDasharray="6 4"
+                      markerEnd="url(#arrowHead)"
+                      opacity="0.78"
+                    />
+                  )}
                 </g>
               </svg>
 
@@ -1243,7 +1648,12 @@ export default function App() {
             <aside className="properties-panel">
               <div className="properties-title">Properties</div>
 
-              {!selectedElement && <p className="muted">Select an element to edit fill, position, text, and stroke.</p>}
+              {selectedIds.length === 0 && (
+                <p className="muted">Select an element to edit fill, position, text, and stroke.</p>
+              )}
+              {hasMultiSelection && (
+                <p className="muted">{selectedIds.length} elements selected. Drag any selected element to move all.</p>
+              )}
 
               {selectedElement && (
                 <>
@@ -1411,7 +1821,7 @@ export default function App() {
                     <button
                       key={`layer-${element.id}`}
                       type="button"
-                      className={`layer-row ${selectedId === element.id ? "active" : ""}`}
+                      className={`layer-row ${selectedIdSet.has(element.id) ? "active" : ""}`}
                       onClick={() => {
                         setSelectedId(element.id);
                         setActiveTab("app");

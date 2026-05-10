@@ -30,6 +30,11 @@ QE Wireframe Tool built with React + Vite (no CDN), with local persistence via I
 - `Rectangle` and `Ellipse` can be resized directly on the canvas via corner drag handles (Select tool), or by `W`/`H` fields in Properties.
 - Rectangle/ellipse minimum size is `20x20`.
 - Main app shell uses full-width layout.
+- `Delete` / `Backspace` removes currently selected element(s) when focus is not inside form inputs.
+- Arrow tool uses connector drag workflow: drag from connector dot on one shape to another connector dot.
+- Select tool supports marquee (drag-box) multi-selection.
+- Multi-selected elements can be moved together by dragging any selected element.
+- `Ctrl+A` / `Cmd+A` selects all elements on the canvas.
 
 ## Key Files
 - `src/App.jsx`: main UI and canvas interactions

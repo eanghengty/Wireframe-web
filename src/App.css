@@ -295,11 +295,29 @@ body {
   cursor: nesw-resize;
 }
 
+.connector-handle {
+  fill: #ffffff;
+  stroke: #0e568f;
+  cursor: crosshair;
+}
+
+.connector-handle:hover {
+  fill: #0e568f;
+}
+
 .selection-outline {
   fill: none;
   stroke: #0e568f;
   stroke-width: 1.4;
   stroke-dasharray: 5 5;
+  pointer-events: none;
+}
+
+.selection-marquee {
+  fill: rgba(14, 86, 143, 0.12);
+  stroke: #0e568f;
+  stroke-width: 1.1;
+  stroke-dasharray: 4 4;
   pointer-events: none;
 }
 

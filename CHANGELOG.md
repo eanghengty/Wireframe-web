@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.2] - 2026-05-10
+
+### Added
+- Keyboard deletion support: `Delete` and `Backspace` now remove selected canvas element(s) when not typing in inputs.
+- Arrow connector handles on rectangle/ellipse/sticky shapes for direct connection authoring.
+- Marquee selection box for drag-selecting multiple elements in Select mode.
+- Multi-selection move support (drag any selected element to move the whole selection).
+- `Ctrl+A` / `Cmd+A` shortcut to select all elements on the canvas.
+
+### Changed
+- Arrow creation flow changed from click-start/click-end to drag-from-connector-to-connector.
+- Layer list highlighting now reflects multi-selection state.
+- Properties panel shows multi-selection guidance when more than one element is selected.
+
 ## [0.1.1] - 2026-05-10
 
 ### Added
