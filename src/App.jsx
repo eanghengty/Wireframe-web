@@ -8,17 +8,23 @@ import {
   MousePointer2,
   PenLine,
   Plus,
+  Redo2,
   Save,
   Square,
   StickyNote,
-  Type
+  Type,
+  Undo2
 } from "lucide-react";
 import {
-  clearStoredDocument,
+  createWorkspace,
+  deleteWorkspace,
   fetchVersions,
-  loadActiveDocument,
+  listWorkspaces,
+  loadActiveWorkspace,
+  loadWorkspace,
   restoreVersion,
-  saveActiveDocument
+  saveWorkspace,
+  setActiveWorkspaceId as persistActiveWorkspaceId
 } from "./db";
 
 const CANVAS_WIDTH = 1400;
@@ -42,6 +48,7 @@ const FILL_COLORS = ["#AFA9EC", "#5DCAA5", "#F0997B", "#85B7EB", "#B4B2A9", "#FA
 const STENCIL_LIBRARY = [];
 const RESIZE_HANDLES = ["nw", "ne", "sw", "se"];
 const CONNECTOR_HANDLES = ["n", "e", "s", "w"];
+const MAX_HISTORY = 100;
 
 const INITIAL_ELEMENTS = [];
 const LEGACY_DEMO_TEXTS = new Set([
@@ -513,6 +520,10 @@ function downloadBlob(filename, blob) {
 
 export default function App() {
   const svgRef = useRef(null);
+  const workspaceNameInputRef = useRef(null);
+  const interactionHistoryStartRef = useRef(null);
+  const elementsRef = useRef(INITIAL_ELEMENTS);
+  const saveVersionNoticeTimeoutRef = useRef(null);
 
   const [activeTab, setActiveTab] = useState("app");
   const [activeTool, setActiveTool] = useState("select");
@@ -523,9 +534,18 @@ export default function App() {
   const [status, setStatus] = useState("Loading from IndexedDB...");
   const [hydrated, setHydrated] = useState(false);
   const [lastSavedAt, setLastSavedAt] = useState(null);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState(null);
+  const [workspaces, setWorkspaces] = useState([]);
   const [versions, setVersions] = useState([]);
   const [showVersions, setShowVersions] = useState(false);
   const [exportFormat, setExportFormat] = useState("png");
+  const [activeDialog, setActiveDialog] = useState(null);
+  const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
+  const [deleteWorkspaceTarget, setDeleteWorkspaceTarget] = useState(null);
+  const [historyByWorkspaceId, setHistoryByWorkspaceId] = useState({});
+  const [dialogBusy, setDialogBusy] = useState(false);
+  const [isSavingVersion, setIsSavingVersion] = useState(false);
+  const [saveVersionNotice, setSaveVersionNotice] = useState(null);
 
   const [arrowDraft, setArrowDraft] = useState(null);
   const [penDraft, setPenDraft] = useState(null);
@@ -536,6 +556,23 @@ export default function App() {
   const selectedId = selectedIds[selectedIds.length - 1] ?? null;
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const hasMultiSelection = selectedIds.length > 1;
+  const isCreateWorkspaceDialogOpen = activeDialog === "create-workspace";
+  const isResetWorkspaceDialogOpen = activeDialog === "reset-workspace";
+  const isDeleteWorkspaceDialogOpen = activeDialog === "delete-workspace";
+  const isDialogOpen = isCreateWorkspaceDialogOpen || isResetWorkspaceDialogOpen || isDeleteWorkspaceDialogOpen;
+
+  function showSaveVersionNotice(message, tone = "success") {
+    setSaveVersionNotice({ message, tone });
+
+    if (saveVersionNoticeTimeoutRef.current) {
+      window.clearTimeout(saveVersionNoticeTimeoutRef.current);
+    }
+
+    saveVersionNoticeTimeoutRef.current = window.setTimeout(() => {
+      setSaveVersionNotice(null);
+      saveVersionNoticeTimeoutRef.current = null;
+    }, 5200);
+  }
 
   function setSelectedId(nextId) {
     setSelectedIds(nextId ? [nextId] : []);
@@ -552,33 +589,540 @@ export default function App() {
     [elements, selectedIds]
   );
 
+  function inferArrowBinding(point, connectableElements, preferredHandle, maxDistance = 10) {
+    let nearest = null;
+    let nearestDistance = maxDistance;
+
+    for (const element of connectableElements) {
+      const handles = preferredHandle ? [preferredHandle] : CONNECTOR_HANDLES;
+
+      for (const handle of handles) {
+        const connectorPoint = getConnectorPoint(element, handle);
+        const distance = Math.hypot(point.x - connectorPoint.x, point.y - connectorPoint.y);
+        if (distance > nearestDistance) {
+          continue;
+        }
+
+        nearest = {
+          elementId: element.id,
+          handle
+        };
+        nearestDistance = distance;
+      }
+    }
+
+    return nearest;
+  }
+
+  function syncConnectedArrows(nextElements) {
+    const connectableElements = nextElements.filter((element) => isArrowConnectableElement(element));
+    if (connectableElements.length === 0) {
+      return nextElements;
+    }
+
+    const connectableById = new Map(connectableElements.map((element) => [element.id, element]));
+    let changed = false;
+
+    const synced = nextElements.map((element) => {
+      if (element.type !== "arrow") {
+        return element;
+      }
+
+      let nextArrow = element;
+
+      const inferredSource = !element.source
+        ? inferArrowBinding(
+            { x: element.x1, y: element.y1 },
+            connectableElements,
+            element.sourceHandle || null
+          )
+        : null;
+      const sourceBinding = element.source || inferredSource;
+      if (
+        sourceBinding &&
+        (!element.source ||
+          element.source.elementId !== sourceBinding.elementId ||
+          element.source.handle !== sourceBinding.handle)
+      ) {
+        nextArrow = {
+          ...nextArrow,
+          source: sourceBinding
+        };
+        changed = true;
+      }
+
+      if (sourceBinding && sourceBinding.handle !== nextArrow.sourceHandle) {
+        nextArrow = {
+          ...nextArrow,
+          sourceHandle: sourceBinding.handle
+        };
+        changed = true;
+      }
+
+      const sourceElement = sourceBinding ? connectableById.get(sourceBinding.elementId) : null;
+      if (sourceElement) {
+        const sourcePoint = getConnectorPoint(sourceElement, sourceBinding.handle);
+        if (sourcePoint.x !== nextArrow.x1 || sourcePoint.y !== nextArrow.y1) {
+          nextArrow = {
+            ...nextArrow,
+            x1: sourcePoint.x,
+            y1: sourcePoint.y
+          };
+          changed = true;
+        }
+      }
+
+      const inferredTarget =
+        !element.target && element.targetHandle
+          ? inferArrowBinding(
+              { x: element.x2, y: element.y2 },
+              connectableElements,
+              element.targetHandle
+            )
+          : null;
+      const targetBinding = element.target || inferredTarget;
+      if (
+        targetBinding &&
+        (!element.target ||
+          element.target.elementId !== targetBinding.elementId ||
+          element.target.handle !== targetBinding.handle)
+      ) {
+        nextArrow = {
+          ...nextArrow,
+          target: targetBinding
+        };
+        changed = true;
+      }
+
+      if (targetBinding && targetBinding.handle !== nextArrow.targetHandle) {
+        nextArrow = {
+          ...nextArrow,
+          targetHandle: targetBinding.handle
+        };
+        changed = true;
+      }
+
+      const targetElement = targetBinding ? connectableById.get(targetBinding.elementId) : null;
+      if (targetElement) {
+        const targetPoint = getConnectorPoint(targetElement, targetBinding.handle);
+        if (targetPoint.x !== nextArrow.x2 || targetPoint.y !== nextArrow.y2) {
+          nextArrow = {
+            ...nextArrow,
+            x2: targetPoint.x,
+            y2: targetPoint.y
+          };
+          changed = true;
+        }
+      }
+
+      return nextArrow;
+    });
+
+    return changed ? synced : nextElements;
+  }
+
+  function setElementsWithArrowSync(next) {
+    const previousElements = elementsRef.current;
+    const nextElements = typeof next === "function" ? next(previousElements) : next;
+    const syncedElements = syncConnectedArrows(nextElements);
+
+    if (previousElements === syncedElements) {
+      return previousElements;
+    }
+
+    elementsRef.current = syncedElements;
+    setElements(syncedElements);
+    return syncedElements;
+  }
+
+  function cloneElementsSnapshot(items) {
+    return JSON.parse(JSON.stringify(Array.isArray(items) ? items : []));
+  }
+
+  function areElementSnapshotsEqual(left, right) {
+    if (left === right) {
+      return true;
+    }
+
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  function getWorkspaceHistory(workspaceId, source = historyByWorkspaceId) {
+    if (!workspaceId) {
+      return { past: [], future: [] };
+    }
+
+    return source[workspaceId] || { past: [], future: [] };
+  }
+
+  function setWorkspaceHistory(workspaceId, updater) {
+    if (!workspaceId) {
+      return;
+    }
+
+    setHistoryByWorkspaceId((previous) => {
+      const current = getWorkspaceHistory(workspaceId, previous);
+      const next = updater(current);
+      if (next === current) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        [workspaceId]: next
+      };
+    });
+  }
+
+  function pushUndoSnapshot(workspaceId, previousElements) {
+    if (!workspaceId) {
+      return;
+    }
+
+    const snapshot = cloneElementsSnapshot(previousElements);
+    setWorkspaceHistory(workspaceId, (current) => {
+      const nextPast = [...current.past, snapshot];
+      if (nextPast.length > MAX_HISTORY) {
+        nextPast.splice(0, nextPast.length - MAX_HISTORY);
+      }
+
+      return {
+        past: nextPast,
+        future: []
+      };
+    });
+  }
+
+  function applyElementsWithoutHistory(next) {
+    return setElementsWithArrowSync(next);
+  }
+
+  function setElementsWithHistory(next, options = {}) {
+    const { trackHistory = true, workspaceId = activeWorkspaceId } = options;
+    const previousElements = elementsRef.current;
+    const rawNext = typeof next === "function" ? next(previousElements) : next;
+    const syncedNext = syncConnectedArrows(rawNext);
+
+    if (areElementSnapshotsEqual(previousElements, syncedNext)) {
+      return previousElements;
+    }
+
+    if (trackHistory) {
+      pushUndoSnapshot(workspaceId, previousElements);
+    }
+
+    elementsRef.current = syncedNext;
+    setElements(syncedNext);
+    return syncedNext;
+  }
+
+  function commitInteractionHistoryIfChanged() {
+    if (!activeWorkspaceId) {
+      interactionHistoryStartRef.current = null;
+      return;
+    }
+
+    const startSnapshot = interactionHistoryStartRef.current;
+    interactionHistoryStartRef.current = null;
+
+    if (!startSnapshot) {
+      return;
+    }
+
+    const currentSnapshot = elementsRef.current;
+    if (!areElementSnapshotsEqual(startSnapshot, currentSnapshot)) {
+      pushUndoSnapshot(activeWorkspaceId, startSnapshot);
+    }
+  }
+
+  function undoCanvasChange() {
+    if (!activeWorkspaceId) {
+      setStatus("No active workspace.");
+      return;
+    }
+
+    const history = getWorkspaceHistory(activeWorkspaceId);
+    if (history.past.length === 0) {
+      setStatus("Nothing to undo.");
+      return;
+    }
+
+    const previousSnapshot = history.past[history.past.length - 1];
+    const currentSnapshot = cloneElementsSnapshot(elementsRef.current);
+    setHistoryByWorkspaceId((previous) => ({
+      ...previous,
+      [activeWorkspaceId]: {
+        past: history.past.slice(0, -1),
+        future: [currentSnapshot, ...history.future].slice(0, MAX_HISTORY)
+      }
+    }));
+
+    applyElementsWithoutHistory(cloneElementsSnapshot(previousSnapshot));
+    setSelectedIds([]);
+    setStatus("Undo applied.");
+  }
+
+  function redoCanvasChange() {
+    if (!activeWorkspaceId) {
+      setStatus("No active workspace.");
+      return;
+    }
+
+    const history = getWorkspaceHistory(activeWorkspaceId);
+    if (history.future.length === 0) {
+      setStatus("Nothing to redo.");
+      return;
+    }
+
+    const nextSnapshot = history.future[0];
+    const currentSnapshot = cloneElementsSnapshot(elementsRef.current);
+    const nextPast = [...history.past, currentSnapshot];
+    if (nextPast.length > MAX_HISTORY) {
+      nextPast.splice(0, nextPast.length - MAX_HISTORY);
+    }
+
+    setHistoryByWorkspaceId((previous) => ({
+      ...previous,
+      [activeWorkspaceId]: {
+        past: nextPast,
+        future: history.future.slice(1)
+      }
+    }));
+
+    applyElementsWithoutHistory(cloneElementsSnapshot(nextSnapshot));
+    setSelectedIds([]);
+    setStatus("Redo applied.");
+  }
+
+  function workspaceNameFromValue(name) {
+    if (name && name !== LEGACY_DEFAULT_DOCUMENT_NAME) {
+      return name;
+    }
+
+    return DEFAULT_DOCUMENT_NAME;
+  }
+
+  function normalizeWorkspaceName(name) {
+    return (name || "").trim().toLowerCase();
+  }
+
+  function parseWorkspaceSuffix(name) {
+    const trimmed = (name || "").trim();
+    const matched = trimmed.match(/^(.*?)(?:\s*\((\d+)\))?$/);
+    if (!matched) {
+      return {
+        baseName: trimmed,
+        explicitNumber: null
+      };
+    }
+
+    const baseName = (matched[1] || "").trim();
+    const explicitNumber = matched[2] ? Number(matched[2]) : null;
+    if (!Number.isFinite(explicitNumber) || explicitNumber < 2) {
+      return {
+        baseName: trimmed,
+        explicitNumber: null
+      };
+    }
+
+    return {
+      baseName: baseName || trimmed,
+      explicitNumber
+    };
+  }
+
+  function buildUniqueWorkspaceName(desiredName, existingWorkspaces) {
+    const parsed = parseWorkspaceSuffix(desiredName);
+    const baseName = parsed.baseName || desiredName;
+    const normalizedBaseName = normalizeWorkspaceName(baseName);
+    const takenNumbers = new Set();
+
+    for (const workspace of existingWorkspaces || []) {
+      const candidateName = workspaceNameFromValue(workspace?.name);
+      const parsedCandidate = parseWorkspaceSuffix(candidateName);
+      const candidateBaseName = parsedCandidate.baseName || candidateName;
+      if (normalizeWorkspaceName(candidateBaseName) !== normalizedBaseName) {
+        continue;
+      }
+
+      if (parsedCandidate.explicitNumber && parsedCandidate.explicitNumber >= 2) {
+        takenNumbers.add(parsedCandidate.explicitNumber);
+      } else {
+        takenNumbers.add(1);
+      }
+    }
+
+    if (!takenNumbers.has(1) && parsed.explicitNumber === null) {
+      return baseName;
+    }
+
+    let nextNumber = parsed.explicitNumber && parsed.explicitNumber >= 2 ? parsed.explicitNumber : 2;
+    while (takenNumbers.has(nextNumber)) {
+      nextNumber += 1;
+    }
+
+    return `${baseName} (${nextNumber})`;
+  }
+
+  function sortWorkspaces(items) {
+    return [...items].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }
+
+  function upsertWorkspaceCache(workspace) {
+    if (!workspace?.id) {
+      return;
+    }
+
+    setWorkspaces((previous) =>
+      sortWorkspaces([
+        workspace,
+        ...previous.filter((item) => item.id !== workspace.id)
+      ])
+    );
+  }
+
+  function clearInteractionState() {
+    setSelectedId(null);
+    setSelectionBox(null);
+    setArrowDraft(null);
+    setPenDraft(null);
+    setDragState(null);
+    setResizeState(null);
+    setShowVersions(false);
+    interactionHistoryStartRef.current = null;
+  }
+
+  function applyWorkspaceState(workspace) {
+    const nextName = workspaceNameFromValue(workspace?.name);
+    const nextElements = Array.isArray(workspace?.elements) ? workspace.elements : INITIAL_ELEMENTS;
+    const legacyDemoLoaded = isLegacyDemoData(nextElements);
+
+    setDocumentName(nextName);
+    applyElementsWithoutHistory(legacyDemoLoaded ? INITIAL_ELEMENTS : nextElements);
+    setZoom(workspace?.zoom || 1);
+    setLastSavedAt(workspace?.updatedAt || null);
+    clearInteractionState();
+
+    return legacyDemoLoaded;
+  }
+
+  async function refreshWorkspaceList() {
+    const items = await listWorkspaces();
+    setWorkspaces(items);
+    return items;
+  }
+
+  useEffect(() => {
+    elementsRef.current = elements;
+  }, [elements]);
+
+  useEffect(
+    () => () => {
+      if (saveVersionNoticeTimeoutRef.current) {
+        window.clearTimeout(saveVersionNoticeTimeoutRef.current);
+      }
+    },
+    []
+  );
+
+  function closeActiveDialog() {
+    if (dialogBusy) {
+      return;
+    }
+
+    setActiveDialog(null);
+    setWorkspaceNameDraft("");
+    setDeleteWorkspaceTarget(null);
+  }
+
+  function handleDialogCancel() {
+    closeActiveDialog();
+  }
+
+  function handleDialogBackdropClick(event) {
+    if (event.target !== event.currentTarget) {
+      return;
+    }
+
+    closeActiveDialog();
+  }
+
+  useEffect(() => {
+    if (!isDialogOpen) {
+      return undefined;
+    }
+
+    function onDialogEscape(event) {
+      if (event.key !== "Escape") {
+        return;
+      }
+
+      event.preventDefault();
+      closeActiveDialog();
+    }
+
+    window.addEventListener("keydown", onDialogEscape);
+    return () => window.removeEventListener("keydown", onDialogEscape);
+  }, [isDialogOpen, dialogBusy]);
+
+  useEffect(() => {
+    if (!isCreateWorkspaceDialogOpen) {
+      return undefined;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      if (workspaceNameInputRef.current) {
+        workspaceNameInputRef.current.focus();
+        workspaceNameInputRef.current.select();
+      }
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [isCreateWorkspaceDialogOpen]);
+
   useEffect(() => {
     let cancelled = false;
 
     async function hydrate() {
       try {
-        const saved = await loadActiveDocument();
+        const savedWorkspace = await loadActiveWorkspace();
         if (cancelled) {
           return;
         }
 
-        if (saved) {
-          const nextName =
-            saved.name && saved.name !== LEGACY_DEFAULT_DOCUMENT_NAME ? saved.name : DEFAULT_DOCUMENT_NAME;
-          const nextElements = Array.isArray(saved.elements) ? saved.elements : INITIAL_ELEMENTS;
-          const legacyDemoLoaded = isLegacyDemoData(nextElements);
+        if (savedWorkspace) {
+          setActiveWorkspaceId(savedWorkspace.id);
+          const legacyDemoLoaded = applyWorkspaceState(savedWorkspace);
+          const items = await listWorkspaces();
+          if (cancelled) {
+            return;
+          }
+          setWorkspaces(items);
 
-          setDocumentName(nextName);
-          setElements(legacyDemoLoaded ? INITIAL_ELEMENTS : nextElements);
-          setZoom(saved.zoom || 1);
-          setLastSavedAt(saved.updatedAt || Date.now());
           if (legacyDemoLoaded) {
-            setStatus("Legacy demo data removed. New draft ready.");
+            setStatus("Legacy demo data removed. Active workspace is ready.");
           } else {
-            setStatus(`Loaded saved draft (${formatTimestamp(saved.updatedAt)})`);
+            setStatus(`Loaded workspace (${formatTimestamp(savedWorkspace.updatedAt)}).`);
           }
         } else {
-          setStatus("New draft ready. Start sketching.");
+          const createdWorkspace = await createWorkspace({
+            name: DEFAULT_DOCUMENT_NAME,
+            elements: INITIAL_ELEMENTS,
+            zoom: 1
+          });
+
+          if (cancelled) {
+            return;
+          }
+
+          setActiveWorkspaceId(createdWorkspace.id);
+          applyWorkspaceState(createdWorkspace);
+          setWorkspaces([createdWorkspace]);
+          setStatus("New workspace created. Start sketching.");
         }
       } catch (error) {
         console.error(error);
@@ -598,13 +1142,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!hydrated) {
+    if (!hydrated || !activeWorkspaceId) {
       return undefined;
     }
 
     const timeoutId = window.setTimeout(async () => {
       try {
-        const result = await saveActiveDocument(
+        const result = await saveWorkspace(
+          activeWorkspaceId,
           {
             name: documentName,
             elements,
@@ -614,6 +1159,7 @@ export default function App() {
         );
 
         setLastSavedAt(result.updatedAt);
+        upsertWorkspaceCache(result);
       } catch (error) {
         console.error(error);
       }
@@ -622,7 +1168,18 @@ export default function App() {
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [hydrated, documentName, elements, zoom]);
+  }, [activeWorkspaceId, hydrated, documentName, elements, zoom]);
+
+  useEffect(() => {
+    if (!hydrated || activeTab !== "workspaces") {
+      return;
+    }
+
+    refreshWorkspaceList().catch((error) => {
+      console.error(error);
+      setStatus("Could not refresh workspace list.");
+    });
+  }, [activeTab, hydrated, activeWorkspaceId]);
 
   useEffect(() => {
     if (!dragState && !resizeState && !penDraft && !arrowDraft && !selectionBox) {
@@ -686,14 +1243,15 @@ export default function App() {
         const dx = point.x - resizeState.start.x;
         const dy = point.y - resizeState.start.y;
 
-        setElements((previous) =>
+        setElementsWithHistory((previous) =>
           previous.map((element) => {
             if (element.id !== resizeState.id) {
               return element;
             }
 
             return resizeElementFromHandle(resizeState.origin, resizeState.handle, dx, dy);
-          })
+          }),
+          { trackHistory: false }
         );
         return;
       }
@@ -702,7 +1260,7 @@ export default function App() {
         const dx = point.x - dragState.start.x;
         const dy = point.y - dragState.start.y;
 
-        setElements((previous) =>
+        setElementsWithHistory((previous) =>
           previous.map((element) => {
             const origin = dragState.origins[element.id];
             if (!origin) {
@@ -710,7 +1268,8 @@ export default function App() {
             }
 
             return shiftElement(origin, dx, dy);
-          })
+          }),
+          { trackHistory: false }
         );
       }
 
@@ -762,6 +1321,7 @@ export default function App() {
         }
 
         setSelectionBox(null);
+        commitInteractionHistoryIfChanged();
         return;
       }
 
@@ -779,12 +1339,22 @@ export default function App() {
             y1: arrowDraft.start.y,
             x2: endPoint.x,
             y2: endPoint.y,
+            source: {
+              elementId: arrowDraft.source.elementId,
+              handle: arrowDraft.source.handle
+            },
+            target: snapTarget
+              ? {
+                  elementId: snapTarget.elementId,
+                  handle: snapTarget.handle
+                }
+              : null,
             sourceHandle: arrowDraft.source.handle,
             targetHandle: snapTarget ? snapTarget.handle : null,
             stroke: "#5F5E5A",
             strokeWidth: 2
           };
-          setElements((previous) => [...previous, arrow]);
+          setElementsWithHistory((previous) => [...previous, arrow], { trackHistory: false });
           setSelectedId(arrow.id);
           setStatus("Arrow connected.");
         } else {
@@ -792,6 +1362,7 @@ export default function App() {
         }
 
         setArrowDraft(null);
+        commitInteractionHistoryIfChanged();
         return;
       }
 
@@ -805,11 +1376,12 @@ export default function App() {
           fill: "none"
         };
 
-        setElements((previous) => [...previous, newPenElement]);
+        setElementsWithHistory((previous) => [...previous, newPenElement], { trackHistory: false });
         setSelectedId(newPenElement.id);
       }
 
       setPenDraft(null);
+      commitInteractionHistoryIfChanged();
     }
 
     window.addEventListener("pointermove", onPointerMove);
@@ -819,12 +1391,35 @@ export default function App() {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [dragState, resizeState, penDraft, arrowDraft, selectionBox, zoom]);
+  }, [dragState, resizeState, penDraft, arrowDraft, selectionBox, zoom, elements, activeWorkspaceId]);
 
   useEffect(() => {
     function onKeyDown(event) {
+      if (isDialogOpen) {
+        return;
+      }
+
       if (event.defaultPrevented || isEditableTarget(event.target)) {
         return;
+      }
+
+      if (dragState || resizeState || penDraft || arrowDraft || selectionBox) {
+        return;
+      }
+
+      if (event.ctrlKey || event.metaKey) {
+        const key = event.key.toLowerCase();
+        if (key === "z" && !event.shiftKey) {
+          event.preventDefault();
+          undoCanvasChange();
+          return;
+        }
+
+        if ((key === "z" && event.shiftKey) || key === "y") {
+          event.preventDefault();
+          redoCanvasChange();
+          return;
+        }
       }
 
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
@@ -841,7 +1436,7 @@ export default function App() {
 
       event.preventDefault();
       const idsToDelete = new Set(selectedIds);
-      setElements((previous) => previous.filter((element) => !idsToDelete.has(element.id)));
+      setElementsWithHistory((previous) => previous.filter((element) => !idsToDelete.has(element.id)));
       setSelectedIds([]);
       setArrowDraft(null);
       setPenDraft(null);
@@ -853,7 +1448,18 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [elements, selectedIds]);
+  }, [
+    elements,
+    selectedIds,
+    isDialogOpen,
+    activeWorkspaceId,
+    historyByWorkspaceId,
+    dragState,
+    resizeState,
+    penDraft,
+    arrowDraft,
+    selectionBox
+  ]);
 
   function getCanvasPointFromEvent(event) {
     const svg = svgRef.current;
@@ -882,7 +1488,7 @@ export default function App() {
       return;
     }
 
-    setElements((previous) =>
+    setElementsWithHistory((previous) =>
       previous.map((element) => {
         if (element.id !== selectedId) {
           return element;
@@ -914,6 +1520,7 @@ export default function App() {
     if (activeTool === "pen") {
       setSelectedId(null);
       setSelectionBox(null);
+      interactionHistoryStartRef.current = cloneElementsSnapshot(elementsRef.current);
       setPenDraft({ id: makeId(), points: [point.x, point.y] });
       return;
     }
@@ -931,7 +1538,7 @@ export default function App() {
       return;
     }
 
-    setElements((previous) => [...previous, newElement]);
+    setElementsWithHistory((previous) => [...previous, newElement]);
     setSelectedId(newElement.id);
     setSelectionBox(null);
     setStatus(`${newElement.type} added.`);
@@ -966,6 +1573,7 @@ export default function App() {
 
     setSelectionBox(null);
     setResizeState(null);
+    interactionHistoryStartRef.current = cloneElementsSnapshot(elementsRef.current);
     setDragState({
       ids: nextSelectedIds,
       origins,
@@ -987,6 +1595,7 @@ export default function App() {
     setSelectedId(element.id);
     setSelectionBox(null);
     setDragState(null);
+    interactionHistoryStartRef.current = cloneElementsSnapshot(elementsRef.current);
     setResizeState({
       id: element.id,
       origin: element,
@@ -1004,6 +1613,7 @@ export default function App() {
     const startPoint = getConnectorPoint(element, handle);
     setSelectedId(element.id);
     setSelectionBox(null);
+    interactionHistoryStartRef.current = cloneElementsSnapshot(elementsRef.current);
     setArrowDraft({
       source: {
         elementId: element.id,
@@ -1022,9 +1632,62 @@ export default function App() {
     return { x, y };
   }
 
-  async function handleSave() {
+  function handleCreateNewWorkspace() {
+    const defaultName = workspaceNameFromValue(documentName).trim() || DEFAULT_DOCUMENT_NAME;
+    setWorkspaceNameDraft(defaultName);
+    setActiveDialog("create-workspace");
+  }
+
+  async function handleCreateWorkspaceDialogConfirm(event) {
+    event.preventDefault();
+    if (dialogBusy) {
+      return;
+    }
+
+    const defaultName = workspaceNameFromValue(documentName).trim() || DEFAULT_DOCUMENT_NAME;
+    const desiredName = workspaceNameDraft.trim() || defaultName;
+    setDialogBusy(true);
+
     try {
-      const result = await saveActiveDocument(
+      const existingWorkspaces = await listWorkspaces();
+      const nextName = buildUniqueWorkspaceName(desiredName, existingWorkspaces);
+      const createdWorkspace = await createWorkspace({
+        name: nextName,
+        elements,
+        zoom
+      });
+
+      setActiveWorkspaceId(createdWorkspace.id);
+      applyWorkspaceState(createdWorkspace);
+      upsertWorkspaceCache(createdWorkspace);
+      setActiveTab("app");
+      setActiveDialog(null);
+      setWorkspaceNameDraft("");
+      setStatus(`New workspace "${createdWorkspace.name}" created and opened.`);
+    } catch (error) {
+      console.error(error);
+      setStatus("Create new workspace failed.");
+    } finally {
+      setDialogBusy(false);
+    }
+  }
+
+  async function handleSaveVersion() {
+    if (isSavingVersion) {
+      return;
+    }
+
+    if (!activeWorkspaceId) {
+      setStatus("No active workspace to version.");
+      showSaveVersionNotice("No active workspace to save.", "error");
+      return;
+    }
+
+    setIsSavingVersion(true);
+
+    try {
+      const result = await saveWorkspace(
+        activeWorkspaceId,
         {
           name: documentName,
           elements,
@@ -1034,10 +1697,33 @@ export default function App() {
       );
 
       setLastSavedAt(result.updatedAt);
-      setStatus(`Saved to IndexedDB (${formatTimestamp(result.updatedAt)}).`);
+      upsertWorkspaceCache(result);
+
+      let items = [];
+      try {
+        items = await fetchVersions(activeWorkspaceId, 10);
+        setVersions(items);
+      } catch (fetchError) {
+        console.error(fetchError);
+      }
+
+      const savedAtLabel = formatTimestamp(result.updatedAt);
+      const workspaceLabel = workspaceNameFromValue(result.name || documentName);
+      const elementCount = Array.isArray(result.elements) ? result.elements.length : elements.length;
+      const elementLabel = `${elementCount} element${elementCount === 1 ? "" : "s"}`;
+      const versionLabel =
+        items.length >= 10
+          ? "10+ recent versions now available."
+          : `${items.length} saved version${items.length === 1 ? "" : "s"} in this workspace.`;
+
+      showSaveVersionNotice(`Saved "${workspaceLabel}" at ${savedAtLabel}. Snapshot captured ${elementLabel}. ${versionLabel}`);
+      setStatus(`Version saved (${savedAtLabel}). Snapshot captured ${elementLabel}.`);
     } catch (error) {
       console.error(error);
-      setStatus("Save failed. Please retry.");
+      showSaveVersionNotice("Save version failed. Please retry.", "error");
+      setStatus("Save version failed.");
+    } finally {
+      setIsSavingVersion(false);
     }
   }
 
@@ -1047,8 +1733,13 @@ export default function App() {
       return;
     }
 
+    if (!activeWorkspaceId) {
+      setStatus("No active workspace.");
+      return;
+    }
+
     try {
-      const items = await fetchVersions(10);
+      const items = await fetchVersions(activeWorkspaceId, 10);
       setVersions(items);
       setShowVersions(true);
     } catch (error) {
@@ -1058,17 +1749,22 @@ export default function App() {
   }
 
   async function handleRestoreVersion(versionId) {
+    if (!activeWorkspaceId) {
+      setStatus("No active workspace.");
+      return;
+    }
+
     try {
-      const version = await restoreVersion(versionId);
+      const version = await restoreVersion(versionId, activeWorkspaceId);
       if (!version) {
+        setStatus("Version not found for the active workspace.");
         return;
       }
 
-      setElements(version.elements || []);
+      setDocumentName(workspaceNameFromValue(version.name));
+      applyElementsWithoutHistory(version.elements || []);
       setZoom(version.zoom || 1);
-      setSelectedId(null);
-      setSelectionBox(null);
-      setShowVersions(false);
+      clearInteractionState();
       setStatus(`Version restored from ${formatTimestamp(version.updatedAt)}.`);
     } catch (error) {
       console.error(error);
@@ -1076,27 +1772,169 @@ export default function App() {
     }
   }
 
-  async function handleResetWorkspace() {
-    if (!window.confirm("Reset canvas and clear saved IndexedDB data?")) {
+  async function handleLoadWorkspace(workspaceId) {
+    if (!workspaceId) {
+      return;
+    }
+
+    if (workspaceId === activeWorkspaceId) {
+      setStatus("That workspace is already active.");
+      setActiveTab("app");
       return;
     }
 
     try {
-      await clearStoredDocument();
-      setDocumentName(DEFAULT_DOCUMENT_NAME);
-      setElements(INITIAL_ELEMENTS);
-      setSelectedId(null);
-      setSelectionBox(null);
-      setArrowDraft(null);
-      setPenDraft(null);
-      setDragState(null);
-      setResizeState(null);
-      setZoom(1);
-      setStatus("Workspace reset. IndexedDB cleared.");
-      setLastSavedAt(null);
+      if (activeWorkspaceId) {
+        const autosaved = await saveWorkspace(
+          activeWorkspaceId,
+          {
+            name: documentName,
+            elements,
+            zoom
+          },
+          { trackVersion: false }
+        );
+        setLastSavedAt(autosaved.updatedAt);
+        upsertWorkspaceCache(autosaved);
+      }
+
+      const nextWorkspace = await loadWorkspace(workspaceId);
+      if (!nextWorkspace) {
+        await refreshWorkspaceList();
+        setStatus("Workspace no longer exists.");
+        return;
+      }
+
+      await persistActiveWorkspaceId(nextWorkspace.id);
+      setActiveWorkspaceId(nextWorkspace.id);
+      const legacyDemoLoaded = applyWorkspaceState(nextWorkspace);
+      upsertWorkspaceCache(nextWorkspace);
+      setActiveTab("app");
+
+      if (legacyDemoLoaded) {
+        setStatus(`Loaded "${workspaceNameFromValue(nextWorkspace.name)}". Legacy demo data removed.`);
+      } else {
+        setStatus(`Loaded "${workspaceNameFromValue(nextWorkspace.name)}". Previous workspace autosaved.`);
+      }
+    } catch (error) {
+      console.error(error);
+      setStatus("Workspace load failed.");
+    }
+  }
+
+  function handleRequestDeleteWorkspace(workspace) {
+    if (!workspace?.id || dialogBusy) {
+      return;
+    }
+
+    setDeleteWorkspaceTarget({
+      id: workspace.id,
+      name: workspaceNameFromValue(workspace.name),
+      isActive: workspace.id === activeWorkspaceId
+    });
+    setActiveDialog("delete-workspace");
+  }
+
+  async function handleDeleteWorkspaceDialogConfirm() {
+    if (!deleteWorkspaceTarget?.id || dialogBusy) {
+      return;
+    }
+
+    setDialogBusy(true);
+
+    try {
+      const deletingId = deleteWorkspaceTarget.id;
+      const deletingName = workspaceNameFromValue(deleteWorkspaceTarget.name);
+      const wasActive = deletingId === activeWorkspaceId;
+
+      await deleteWorkspace(deletingId);
+      setHistoryByWorkspaceId((previous) => {
+        if (!Object.prototype.hasOwnProperty.call(previous, deletingId)) {
+          return previous;
+        }
+
+        const next = { ...previous };
+        delete next[deletingId];
+        return next;
+      });
+      const remainingWorkspaces = await listWorkspaces();
+      setWorkspaces(remainingWorkspaces);
+
+      if (wasActive) {
+        setVersions([]);
+        if (remainingWorkspaces.length > 0) {
+          const fallbackWorkspace = remainingWorkspaces[0];
+          await persistActiveWorkspaceId(fallbackWorkspace.id);
+          setActiveWorkspaceId(fallbackWorkspace.id);
+          applyWorkspaceState(fallbackWorkspace);
+          setActiveTab("app");
+          setStatus(`Workspace "${deletingName}" deleted. Loaded "${workspaceNameFromValue(fallbackWorkspace.name)}".`);
+        } else {
+          const createdWorkspace = await createWorkspace({
+            name: DEFAULT_DOCUMENT_NAME,
+            elements: INITIAL_ELEMENTS,
+            zoom: 1
+          });
+
+          setActiveWorkspaceId(createdWorkspace.id);
+          applyWorkspaceState(createdWorkspace);
+          setWorkspaces([createdWorkspace]);
+          setActiveTab("app");
+          setStatus(`Workspace "${deletingName}" deleted. New blank workspace created.`);
+        }
+      } else {
+        setStatus(`Workspace "${deletingName}" deleted.`);
+      }
+
+      setActiveDialog(null);
+      setDeleteWorkspaceTarget(null);
+    } catch (error) {
+      console.error(error);
+      setStatus("Delete workspace failed.");
+    } finally {
+      setDialogBusy(false);
+    }
+  }
+
+  function handleResetWorkspace() {
+    if (!activeWorkspaceId) {
+      setStatus("No active workspace.");
+      return;
+    }
+
+    setActiveDialog("reset-workspace");
+  }
+
+  async function handleResetWorkspaceDialogConfirm() {
+    if (!activeWorkspaceId || dialogBusy) {
+      return;
+    }
+    setDialogBusy(true);
+
+    try {
+      const resetWorkspace = await saveWorkspace(
+        activeWorkspaceId,
+        {
+          name: workspaceNameFromValue(documentName),
+          elements: INITIAL_ELEMENTS,
+          zoom: 1
+        },
+        { trackVersion: false }
+      );
+
+      setActiveWorkspaceId(resetWorkspace.id);
+      applyWorkspaceState(resetWorkspace);
+      upsertWorkspaceCache(resetWorkspace);
+      setVersions([]);
+      setActiveTab("app");
+      setActiveDialog(null);
+      setWorkspaceNameDraft("");
+      setStatus(`Workspace "${workspaceNameFromValue(resetWorkspace.name)}" reset. Other workspaces were kept.`);
     } catch (error) {
       console.error(error);
       setStatus("Reset failed.");
+    } finally {
+      setDialogBusy(false);
     }
   }
 
@@ -1196,12 +2034,19 @@ export default function App() {
     const offsetY = 120 + ((index + 1) % 3) * 90;
     const newElement = stencil.create(offsetX, offsetY);
 
-    setElements((previous) => [...previous, newElement]);
+    setElementsWithHistory((previous) => [...previous, newElement]);
     setActiveTab("app");
     setSelectedId(newElement.id);
     setSelectionBox(null);
     setStatus(`${stencil.title} added from stencil library.`);
   }
+
+  const activeWorkspace =
+    workspaces.find((workspace) => workspace.id === activeWorkspaceId) || null;
+  const activeWorkspaceName = workspaceNameFromValue(activeWorkspace?.name || documentName);
+  const activeWorkspaceHistory = getWorkspaceHistory(activeWorkspaceId);
+  const canUndo = activeWorkspaceHistory.past.length > 0;
+  const canRedo = activeWorkspaceHistory.future.length > 0;
 
   const selectedAnchor = selectedElement ? getElementAnchor(selectedElement) : null;
   const resizeHandleRadius = 6 / zoom;
@@ -1220,6 +2065,13 @@ export default function App() {
           type="button"
         >
           App layout
+        </button>
+        <button
+          className={`tab-btn ${activeTab === "workspaces" ? "active" : ""}`}
+          onClick={() => setActiveTab("workspaces")}
+          type="button"
+        >
+          Save & Load
         </button>
         <button
           className={`tab-btn ${activeTab === "stencils" ? "active" : ""}`}
@@ -1252,9 +2104,23 @@ export default function App() {
             </div>
 
             <div className="topbar-actions">
-              <button className="ghost-btn" onClick={handleSave} type="button">
-                <Save size={14} /> Save
+              <button className="ghost-btn history-action-btn" onClick={undoCanvasChange} type="button" disabled={!canUndo}>
+                <Undo2 size={14} /> Undo
               </button>
+              <button className="ghost-btn history-action-btn" onClick={redoCanvasChange} type="button" disabled={!canRedo}>
+                <Redo2 size={14} /> Redo
+              </button>
+              <button className="ghost-btn" onClick={handleCreateNewWorkspace} type="button">
+                <Save size={14} /> Create New Workspace
+              </button>
+              <button className="ghost-btn" onClick={handleSaveVersion} type="button" disabled={isSavingVersion}>
+                <History size={14} /> {isSavingVersion ? "Saving..." : "Save Version"}
+              </button>
+              {saveVersionNotice && (
+                <span className={`save-version-feedback ${saveVersionNotice.tone}`} role="status" aria-live="polite">
+                  {saveVersionNotice.message}
+                </span>
+              )}
               <button className="ghost-btn" onClick={handleVersionsToggle} type="button">
                 <History size={14} /> Versions
               </button>
@@ -1266,7 +2132,7 @@ export default function App() {
 
           {showVersions && (
             <div className="versions-popover" role="dialog" aria-label="Saved versions">
-              <div className="versions-title">Recent versions</div>
+              <div className="versions-title">Recent versions - {activeWorkspaceName}</div>
               {versions.length === 0 && <p className="versions-empty">No manual saves yet.</p>}
               {versions.map((version) => (
                 <button
@@ -1841,6 +2707,80 @@ export default function App() {
         </section>
       )}
 
+      {activeTab === "workspaces" && (
+        <section className="panel workspace-save-load-view">
+          <div className="workspace-manager-card">
+            <div className="workspace-manager-head">
+              <div>
+                <h2>Save and load workspaces</h2>
+                <p>Create a new workspace from this draft, then load any workspace when needed.</p>
+              </div>
+              <div className="workspace-manager-actions">
+                <button type="button" className="ghost-btn" onClick={handleCreateNewWorkspace}>
+                  <Save size={14} /> Create New Workspace
+                </button>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={() => {
+                    refreshWorkspaceList().catch((error) => {
+                      console.error(error);
+                      setStatus("Could not refresh workspace list.");
+                    });
+                  }}
+                >
+                  Refresh list
+                </button>
+              </div>
+            </div>
+
+            <div className="workspace-list">
+              {workspaces.length === 0 && (
+                <p className="workspace-empty">No workspaces yet. Click Create New Workspace to make one.</p>
+              )}
+
+              {workspaces.map((workspace) => {
+                const isActive = workspace.id === activeWorkspaceId;
+                const workspaceName = workspaceNameFromValue(workspace.name);
+
+                return (
+                  <article key={workspace.id} className={`workspace-item ${isActive ? "active" : ""}`}>
+                    <div className="workspace-item-main">
+                      <div className="workspace-item-title-row">
+                        <h3>{workspaceName}</h3>
+                        {isActive && <span className="workspace-active-tag">Active</span>}
+                      </div>
+                      <div className="workspace-item-meta">
+                        Last save: {formatTimestamp(workspace.updatedAt)} | Elements:{" "}
+                        {Array.isArray(workspace.elements) ? workspace.elements.length : 0}
+                      </div>
+                    </div>
+
+                    <div className="workspace-item-actions">
+                      <button
+                        type="button"
+                        className={`ghost-btn ${isActive ? "workspace-load-btn-active" : ""}`}
+                        onClick={() => handleLoadWorkspace(workspace.id)}
+                        disabled={isActive}
+                      >
+                        {isActive ? "Loaded" : "Load"}
+                      </button>
+                      <button
+                        type="button"
+                        className="warn-btn workspace-delete-btn"
+                        onClick={() => handleRequestDeleteWorkspace(workspace)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+      )}
+
       {activeTab === "stencils" && (
         <section className="panel stencil-view">
           <div className="stencil-grid">
@@ -1900,9 +2840,109 @@ export default function App() {
         </section>
       )}
 
+      {isDialogOpen && (
+        <div className="dialog-backdrop" role="presentation" onClick={handleDialogBackdropClick}>
+          {isCreateWorkspaceDialogOpen && (
+            <div
+              className="dialog-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="create-workspace-dialog-title"
+              aria-describedby="create-workspace-dialog-copy"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <form className="dialog-form" onSubmit={handleCreateWorkspaceDialogConfirm}>
+                <h2 id="create-workspace-dialog-title" className="dialog-title">
+                  Create new workspace
+                </h2>
+                <p id="create-workspace-dialog-copy" className="dialog-copy">
+                  Name your new workspace. If left blank, it will use the default workspace name.
+                </p>
+                <label className="dialog-field" htmlFor="workspace-name-input">
+                  Workspace name
+                </label>
+                <input
+                  ref={workspaceNameInputRef}
+                  id="workspace-name-input"
+                  className="dialog-input"
+                  type="text"
+                  value={workspaceNameDraft}
+                  onChange={(event) => setWorkspaceNameDraft(event.target.value)}
+                  disabled={dialogBusy}
+                />
+                <div className="dialog-actions">
+                  <button type="button" className="ghost-btn" onClick={handleDialogCancel} disabled={dialogBusy}>
+                    Cancel
+                  </button>
+                  <button type="submit" className="primary-btn" disabled={dialogBusy}>
+                    {dialogBusy ? "Creating..." : "Create Workspace"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+
+          {isResetWorkspaceDialogOpen && (
+            <div
+              className="dialog-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="reset-workspace-dialog-title"
+              aria-describedby="reset-workspace-dialog-copy"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="reset-workspace-dialog-title" className="dialog-title">
+                Reset this workspace?
+              </h2>
+              <p id="reset-workspace-dialog-copy" className="dialog-copy">
+                This resets only the active workspace to a blank canvas. Other saved workspaces and version history
+                are kept.
+              </p>
+              <div className="dialog-actions">
+                <button type="button" className="ghost-btn" onClick={handleDialogCancel} disabled={dialogBusy}>
+                  Cancel
+                </button>
+                <button type="button" className="warn-btn" onClick={handleResetWorkspaceDialogConfirm} disabled={dialogBusy}>
+                  {dialogBusy ? "Resetting..." : "Reset Workspace"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {isDeleteWorkspaceDialogOpen && (
+            <div
+              className="dialog-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="delete-workspace-dialog-title"
+              aria-describedby="delete-workspace-dialog-copy"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="delete-workspace-dialog-title" className="dialog-title">
+                Delete workspace?
+              </h2>
+              <p id="delete-workspace-dialog-copy" className="dialog-copy">
+                Delete "{workspaceNameFromValue(deleteWorkspaceTarget?.name || DEFAULT_DOCUMENT_NAME)}" permanently?
+                This will also remove its saved versions.
+              </p>
+              <div className="dialog-actions">
+                <button type="button" className="ghost-btn" onClick={handleDialogCancel} disabled={dialogBusy}>
+                  Cancel
+                </button>
+                <button type="button" className="warn-btn" onClick={handleDeleteWorkspaceDialogConfirm} disabled={dialogBusy}>
+                  {dialogBusy ? "Deleting..." : "Delete Workspace"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       <footer className="status-row">
         <span>{status}</span>
-        <span>Autosave: IndexedDB</span>
+        <span>
+          Workspace: {activeWorkspaceName} | Autosave: IndexedDB
+        </span>
       </footer>
     </div>
   );

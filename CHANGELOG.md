@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-05-10
+
+### Fixed
+- Fixed a regression where canvas undo/redo could no-op when triggered by toolbar buttons or `Ctrl/Cmd+Z` shortcuts.
+- Undo/redo now reads and applies workspace history snapshots deterministically before updating history state.
+
+## [0.2.0] - 2026-05-10
+
+### Added
+- New `Save & Load` tab for workspace management.
+- Explicit `Create New Workspace` action in both app toolbar and `Save & Load` tab.
+- Workspace list with active indicator and one-click `Load`.
+- `Save Version` action for manual restore points on the active workspace.
+- IndexedDB active-workspace metadata store for tracking current workspace.
+
+### Changed
+- Persistence model upgraded from single active document to multi-workspace storage.
+- Existing legacy `active-document` records are migrated into a real workspace during DB upgrade.
+- `Versions` history is now scoped to the active workspace.
+- Switching workspaces now autosaves the current workspace before loading the target workspace.
+- Status footer now shows the active workspace name.
+- Reset now clears only the active workspace canvas; other workspaces and version history are kept.
+- Replaced native browser `prompt`/`confirm` with styled in-app dialogs for workspace create/reset actions.
+- New workspace creation now prevents duplicate titles using case-insensitive auto suffixes (`(2)`, `(3)`, ...).
+- Added workspace deletion from `Save & Load` with confirmation; deleting a workspace also removes its version history.
+- Added canvas undo/redo per workspace (100 in-session steps) with topbar controls and keyboard shortcuts.
+
+## [0.1.3] - 2026-05-10
+
+### Added
+- Arrow endpoint bindings now persist source/target connector references (`elementId` + handle) for live connection tracking.
+
+### Changed
+- Arrow rendering updated from straight segments to smooth curved connector paths.
+- Connected arrows now auto-follow their bound shapes when those shapes are moved or resized.
+- Existing saved arrows without connector binding metadata are auto-inferred and synchronized when possible.
+
 ## [0.1.2] - 2026-05-10
 
 ### Added
